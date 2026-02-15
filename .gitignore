@@ -1,1 +1,6 @@
-dataset/
+/data/
+/checkpoints/
+__pycache__/
+/notebooks/
+/artifacts/
+tests.py

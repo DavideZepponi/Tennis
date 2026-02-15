@@ -1,0 +1,7 @@
+original_dataset:
+  path: "data/raw"
+torch_dataset:
+  path: "data/processed"
+  adj_context: 25
+  max_consec_nan: 5
+  min_seq_len: 20
