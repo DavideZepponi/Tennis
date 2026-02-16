@@ -87,9 +87,9 @@ def load_clip(clip_path: Path, adj_context: int):
 
     return dataset
 
-def preprocess_clip(dataset, max_consec_nan: int, min_seq_len: int):
+def preprocess_clip(dataset, max_consec_nan: int, min_seq_len: int, image_h: int, image_w: int):
     frame_transform = T.Compose([
-        T.Resize((224, 224))
+        T.Resize((image_h, image_w))
     ])
 
     def interp(arr):
@@ -198,7 +198,7 @@ def preprocessing():
     with open("config.yaml", "r") as file:
         config = yaml.safe_load(file)
 
-    path = Path(config["torch_dataset"]["path"])
+    path = Path(config["torch_dataset"]["path"]) / f"{config["torch_dataset"]["image_h"]}x{config["torch_dataset"]["image_w"]}"
 
     if Path(path).exists():
         print("\nDataset with same name found in folder. Skipping Dataset Creation.")
@@ -220,12 +220,14 @@ def preprocessing():
                 dataset = preprocess_clip(
                     dataset=dataset,
                     max_consec_nan=config["torch_dataset"]["max_consec_nan"],
-                    min_seq_len=config["torch_dataset"]["min_seq_len"]
+                    min_seq_len=config["torch_dataset"]["min_seq_len"],
+                    image_h=config["torch_dataset"]["image_h"],
+                    image_w=config["torch_dataset"]["image_w"]
                 )
 
                 index_contexts, index_targets_frames = save_clip(
                     dataset=dataset,
-                    path=Path(config["torch_dataset"]["path"]),
+                    path=Path(config["torch_dataset"]["path"]) / f"{config["torch_dataset"]["image_h"]}x{config["torch_dataset"]["image_w"]}",
                     index_contexts=index_contexts,
                     index_targets_frames=index_targets_frames
                 )

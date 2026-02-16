@@ -16,7 +16,7 @@ class TrajectoryTransformer(nn.Module):
         coord_dim: int = 2,
         traj_input_dim: int = 2,
         freeze_backbone: bool = True,
-        max_seq_len: int = 2048,
+        max_seq_len: int = 16384,
     ):
         super().__init__()
         self.d_model = d_model
@@ -50,21 +50,28 @@ class TrajectoryTransformer(nn.Module):
 
     def forward(
         self,
-        frames: torch.Tensor,
-        tgt: torch.Tensor,
-        device: torch.device,
-        frame_lengths: torch.Tensor | None = None,
-        tgt_lengths: torch.Tensor | None = None,
-        encoder_trajectory: torch.Tensor | None = None,
-        encoder_traj_lengths: torch.Tensor | None = None,
+        frames, tgt, device,
+        frame_lengths=None, tgt_lengths=None,
+        encoder_trajectory=None, encoder_traj_lengths=None,
     ):
         B, T_f = frames.shape[0], frames.shape[1]
         T_tgt = tgt.shape[1]
+        tokens_per_frame = self.encoder.visual_backbone.tokens_per_frame
 
+        # Frame-level mask → passed to encoder (encoder expands internally)
         frame_pad_mask = (
             self._lengths_to_pad_mask(frame_lengths, T_f, device)
             if frame_lengths is not None else None
         )
+
+        # Token-level mask → used for decoder memory_pad_mask
+        T_visual = T_f * tokens_per_frame
+        if frame_lengths is not None:
+            scaled_frame_mask = self._lengths_to_pad_mask(
+                frame_lengths * tokens_per_frame, T_visual, device
+            )
+        else:
+            scaled_frame_mask = None
 
         encoder_traj_pad_mask = None
         if encoder_trajectory is not None and encoder_traj_lengths is not None:
@@ -78,6 +85,7 @@ class TrajectoryTransformer(nn.Module):
             if tgt_lengths is not None else None
         )
 
+        # Encoder gets frame-level mask
         memory = self.encoder(
             frames=frames,
             device=device,
@@ -86,8 +94,9 @@ class TrajectoryTransformer(nn.Module):
             traj_pad_mask=encoder_traj_pad_mask,
         )
 
+        # Decoder gets token-level memory mask
         memory_pad_mask = self._build_memory_pad_mask(
-            T_f, frame_pad_mask,
+            T_visual, scaled_frame_mask,
             encoder_trajectory, encoder_traj_pad_mask,
             B, device,
         )
@@ -126,13 +135,25 @@ class TrajectoryTransformer(nn.Module):
                 ]
             else:
                 start_pos = encoder_trajectory[:, -1, :]
+
         self.eval()
         B, T_f = frames.shape[0], frames.shape[1]
+        tokens_per_frame = self.encoder.visual_backbone.tokens_per_frame
 
+        # Frame-level mask → encoder (expands internally)
         frame_pad_mask = (
             self._lengths_to_pad_mask(frame_lengths, T_f, device)
             if frame_lengths is not None else None
         )
+
+        # Token-level mask → decoder memory_pad_mask
+        T_visual = T_f * tokens_per_frame
+        if frame_lengths is not None:
+            scaled_frame_mask = self._lengths_to_pad_mask(
+                frame_lengths * tokens_per_frame, T_visual, device
+            )
+        else:
+            scaled_frame_mask = None
 
         encoder_traj_pad_mask = None
         if encoder_trajectory is not None and encoder_traj_lengths is not None:
@@ -150,7 +171,7 @@ class TrajectoryTransformer(nn.Module):
         )
 
         memory_pad_mask = self._build_memory_pad_mask(
-            T_f, frame_pad_mask,
+            T_visual, scaled_frame_mask,
             encoder_trajectory, encoder_traj_pad_mask,
             B, device,
         )
@@ -178,7 +199,7 @@ class TrajectoryTransformer(nn.Module):
         all_coords = generated[:, 1:, :]
         all_stop_probs = torch.cat(all_stop_probs, dim=1)
         return all_coords, all_stop_probs
-
+    
     @staticmethod
     def _build_memory_pad_mask(
         T_f: int,
@@ -188,7 +209,6 @@ class TrajectoryTransformer(nn.Module):
         B: int,
         device: torch.device,
     ):
-        
         if encoder_trajectory is not None:
             T_t = encoder_trajectory.shape[1]
             if frame_pad_mask is None:

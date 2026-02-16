@@ -1,8 +1,12 @@
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
-from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights
 import torch.nn as nn
 import torch
 import math
+import yaml
+
+with open("config.yaml", "r") as file:
+    config = yaml.safe_load(file)
 
 class SinusoidalPositionalEncoding(nn.Module):
 
@@ -24,10 +28,12 @@ class VisualBackbone(nn.Module):
 
     def __init__(self, freeze: bool = True):
         super().__init__()
-        weights = ResNet18_Weights.DEFAULT
-        backbone = resnet18(weights=weights)
-        self.backbone = nn.Sequential(*list(backbone.children())[:-1])
-        self.feat_dim = 512  # ResNet-18 last-layer channels
+        weights = ConvNeXt_Tiny_Weights.DEFAULT
+        backbone = convnext_tiny(weights=weights)
+
+        self.backbone = backbone.features
+
+        self.spatial_pool = nn.AdaptiveAvgPool2d((2, 4)) 
 
         self.register_buffer(
             "mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -36,19 +42,31 @@ class VisualBackbone(nn.Module):
             "std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         )
 
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, config["torch_dataset"]["image_h"], config["torch_dataset"]["image_w"])
+            out = self.backbone(dummy)
+            out = self.spatial_pool(out)
+            self.feat_dim = out.shape[1]
+            self.grid_h = out.shape[2]
+            self.grid_w = out.shape[3]    
+
+        self.tokens_per_frame = self.grid_h * self.grid_w
+
         if freeze:
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
-    def normalize(self, x: torch.Tensor):
+    def normalize(self, x):
         return (x - self.mean.to(dtype=x.dtype)) / self.std.to(dtype=x.dtype)
 
-    def forward(self, frames: torch.Tensor):
+    def forward(self, frames):
         B, T, C, H, W = frames.shape
         x = frames.reshape(B * T, C, H, W)
         x = self.normalize(x)
         x = self.backbone(x)
-        x = x.reshape(B, T, self.feat_dim)
+        x = self.spatial_pool(x)
+        x = x.flatten(2).transpose(1, 2)
+        x = x.reshape(B, T * self.tokens_per_frame, self.feat_dim)
         return x
 
 class ModalityEmbedding(nn.Module):
@@ -129,6 +147,11 @@ class TrajectoryEncoder(nn.Module):
         vis_feat = self.visual_backbone(frames)
         vis_tokens = self.proj_visual(vis_feat)
         T_f = vis_tokens.shape[1]
+
+        if frame_pad_mask is not None:
+            frame_pad_mask = frame_pad_mask.repeat_interleave(
+                self.visual_backbone.tokens_per_frame, dim=1
+            )
 
         # --- Positional + modality for visual ---
         vis_tokens = (

@@ -77,7 +77,7 @@ class TrajectoryDecoder(nn.Module):
                 nn.init.zeros_(module.bias)
 
     @staticmethod
-    def _causal_mask(seq_len: int, device: torch.device) -> torch.BoolTensor:
+    def _causal_mask(seq_len: int, device: torch.device):
         return torch.triu(
             torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
             diagonal=1,

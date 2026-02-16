@@ -218,6 +218,7 @@ def train(
     dataset,
     models,
     batch_size,
+    warmup_epochs,
     num_epochs,
     patience
 ):
@@ -266,7 +267,7 @@ def train(
         optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, betas=(0.9, 0.98), eps=1e-9)
         loss_fn = torch.nn.SmoothL1Loss()
 
-        warmup_epochs = 5
+        warmup_epochs = warmup_epochs
         warmup_scheduler = optim.lr_scheduler.LinearLR(
             optimizer, start_factor=0.01, total_iters=warmup_epochs)
         cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(

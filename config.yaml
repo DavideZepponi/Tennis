@@ -1,7 +1,9 @@
 original_dataset:
   path: "data/raw"
 torch_dataset:
-  path: "data/processed"
+  path: "data/"
   adj_context: 25
   max_consec_nan: 5
-  min_seq_len: 20
+  min_seq_len: 40
+  image_h: 256
+  image_w: 448
