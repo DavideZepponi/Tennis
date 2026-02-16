@@ -1,7 +1,7 @@
-from src.data.dataset import collate_fn, FlippedDataset
+from src.data.dataset import collate_fn, AugmentedDataset
 from torch.utils.data import DataLoader, random_split
 from src.utils.visuals import plot_training
-from torch.utils.data import ConcatDataset
+from torch.amp import autocast, GradScaler
 import torch.optim as optim
 from tqdm.auto import tqdm
 from torch import nn
@@ -15,13 +15,26 @@ class EfficientSampler(torch.utils.data.Sampler):
         self.batch_size = batch_size
         self.shuffle = shuffle
 
-        # Get lengths by peeking at actual items — works with any dataset type
+        base = dataset
+        while not hasattr(base, 'index'):
+            if hasattr(base, 'base_ds'):
+                base = base.base_ds
+            elif hasattr(base, 'dataset'):
+                base = base.dataset
+            else:
+                raise ValueError(f"Cannot unwrap {type(base)} to find root Dataset")
+
         self.lengths = []
-        for idx in range(len(dataset)):
-            item = dataset[idx]
-            n_frames = item[1].shape[0]
-            n_target = item[3].shape[0]
-            self.lengths.append(n_frames + n_target)
+        for entry in base.index:
+            if "n_frames" in entry:
+                self.lengths.append(entry["n_frames"] + entry["n_target"])
+            else:
+                sample = torch.load(entry["file"], weights_only=True)
+                self.lengths.append(sample["X_frame"].shape[0] + sample["y_coord"].shape[0])
+
+        if len(dataset) > len(self.lengths):
+            self.lengths = self.lengths * (len(dataset) // len(self.lengths) + 1)
+        self.lengths = self.lengths[:len(dataset)]
 
         self.sorted_indices = sorted(
             range(len(self.lengths)),
@@ -44,7 +57,10 @@ class EfficientSampler(torch.utils.data.Sampler):
     def __len__(self):
         return len(self.dataset)
 
-def train_step(model, batch, optimizer, loss_fn, device):
+def train_step(
+    model, batch, optimizer, loss_fn,
+    device, scaler, accum_steps=8, step_idx=0
+):
     model.train()
 
     (
@@ -52,7 +68,7 @@ def train_step(model, batch, optimizer, loss_fn, device):
         X_l, y_l
     ) = batch
 
-    X_frames = X_frames.to(device).float()
+    X_frames = X_frames.to(device).float() / 255.0
     X_coords = X_coords.to(device)
     y_coords = y_coords.to(device)
     X_l = X_l.to(device)
@@ -63,38 +79,46 @@ def train_step(model, batch, optimizer, loss_fn, device):
 
     dec_lengths = y_l - 1
 
-    coords, stop_logits = model.forward(
-        frames=X_frames,
-        tgt=y_coords_input,
-        device=device,
-        frame_lengths=X_l,
-        tgt_lengths=dec_lengths,
-        encoder_trajectory=X_coords,
-        encoder_traj_lengths=X_l
-    )
+    with autocast(device_type=device.type):
+        coords, stop_logits = model.forward(
+            frames=X_frames,
+            tgt=y_coords_input,
+            device=device,
+            frame_lengths=X_l,
+            tgt_lengths=dec_lengths,
+            encoder_trajectory=X_coords,
+            encoder_traj_lengths=X_l,
+        )
 
-    B, T, _ = coords.shape
+        B, T, _ = coords.shape
+        valid = torch.arange(T, device=device).unsqueeze(0) < dec_lengths.unsqueeze(1)
 
-    valid = torch.arange(T, device=device).unsqueeze(0) < dec_lengths.unsqueeze(1)
+        coord_loss = loss_fn(coords[valid], y_coords_output[valid])
 
-    coord_loss = loss_fn(coords[valid], y_coords_output[valid])
+        stop_labels = torch.zeros(B, T, 1, device=device)
+        stop_labels[torch.arange(B, device=device), dec_lengths - 1, 0] = 1.0
 
-    stop_labels = torch.zeros(B, T, 1, device=device)
-    stop_labels[torch.arange(B, device=device), dec_lengths - 1, 0] = 1.0
+        stop_loss = nn.functional.binary_cross_entropy_with_logits(
+            stop_logits[valid], stop_labels[valid],
+        )
 
-    stop_loss = nn.functional.binary_cross_entropy_with_logits(
-        stop_logits[valid], stop_labels[valid],
-    )
+        lambda_stop = 0.5
+        raw_loss = coord_loss + lambda_stop * stop_loss
 
-    lambda_stop = 0.5
-    loss = coord_loss + lambda_stop * stop_loss
+        loss = raw_loss / accum_steps
 
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    optimizer.step()
+    scaler.scale(loss).backward()
 
-    return loss.item()
+    if (step_idx + 1) % accum_steps == 0:
+
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+
+    return raw_loss.item()
 
 def evaluate(model, valid_dl, loss_fn, device):
     model.eval()
@@ -152,22 +176,40 @@ def evaluate(model, valid_dl, loss_fn, device):
 
     return avg_total_loss
 
-def training_routine(name, model, loss_fn, optimizer, device, num_epochs, train_dl, valid_dl, ds, patience=5, min_delta=0.0, scheduler=None):
+def training_routine(
+    name, model, loss_fn, optimizer, device,
+    num_epochs, train_dl, valid_dl, ds, patience=5,
+    min_delta=0.0, scheduler=None, accum_steps=8
+):
     loss_train_hist, loss_valid_hist = [], []
     best_model_state, best_loss, no_improve = None, float("inf"), 0
+    scaler = GradScaler()
 
     for epoch in tqdm(range(num_epochs), desc="Overall Progress", unit="epoch"):
 
         # --- Training ---
+        global_step = 0
         total_loss, total_steps = 0, 0
+        optimizer.zero_grad()
 
         for batch in tqdm(train_dl, desc="Training", leave=False):
             loss = train_step(
-                model, batch, optimizer, loss_fn, device,
+                model, batch, optimizer, loss_fn, device, scaler, accum_steps, global_step
             )
-            batch_size = batch[1].shape[0] if isinstance(batch, (list, tuple)) else batch.shape[0]
-            total_loss += loss * batch_size
-            total_steps += batch_size
+            global_step += 1
+            y_l = batch[4]
+            n_valid = (y_l - 1).sum().item()
+            total_loss += loss * n_valid
+            total_steps += n_valid
+
+        if global_step % accum_steps != 0:
+
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
 
         avg_loss_train = total_loss / total_steps
         loss_train_hist.append(avg_loss_train)
@@ -220,7 +262,8 @@ def train(
     batch_size,
     warmup_epochs,
     num_epochs,
-    patience
+    patience,
+    accum_steps
 ):
     torch.manual_seed(0)
 
@@ -228,8 +271,7 @@ def train(
     pin_memory = torch.cuda.is_available()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    flipped_ds = FlippedDataset(dataset)
-    dataset_daug = ConcatDataset([dataset, flipped_ds])
+    dataset_daug = AugmentedDataset(dataset)
 
     train_ds, valid_ds = random_split(dataset_daug, [0.9, 0.1])
 
@@ -243,9 +285,9 @@ def train(
         sampler=sampler,
         pin_memory=pin_memory,
         collate_fn=collate_fn,
-        num_workers=num_workers,
-        persistent_workers=True,
-        prefetch_factor=2,
+        #num_workers=num_workers,
+        #persistent_workers=True,
+        #prefetch_factor=4,
     )
 
     valid_dl = DataLoader(
@@ -254,17 +296,22 @@ def train(
         shuffle=False,
         pin_memory=pin_memory,
         collate_fn=collate_fn,
-        num_workers=num_workers,
-        persistent_workers=True,
-        prefetch_factor=2,
+        #num_workers=num_workers,
+        #persistent_workers=True,
+        #prefetch_factor=4,
     )
 
     for name, model in models.items():
         model = model.to(device)
         num_epochs = num_epochs
 
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, betas=(0.9, 0.98), eps=1e-9)
+        backbone_params = [p for n, p in model.named_parameters() if "visual_backbone.backbone" in n and p.requires_grad]
+        other_params = [p for n, p in model.named_parameters() if "visual_backbone.backbone" not in n and p.requires_grad]
+
+        optimizer = torch.optim.AdamW([
+            {"params": backbone_params, "lr": 1e-5 * accum_steps},
+            {"params": other_params, "lr": 3e-4 * accum_steps},
+        ], betas=(0.9, 0.98), eps=1e-9, weight_decay=0.05)
         loss_fn = torch.nn.SmoothL1Loss()
 
         warmup_epochs = warmup_epochs
@@ -279,5 +326,6 @@ def train(
 
         training_routine(
             name, model, loss_fn, optimizer, device, num_epochs,
-            train_dl, valid_dl, dataset, patience, scheduler=scheduler,
+            train_dl, valid_dl, dataset, patience,
+            scheduler=scheduler, accum_steps=accum_steps
         )

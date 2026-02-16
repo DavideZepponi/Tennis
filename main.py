@@ -11,17 +11,17 @@ def main():
 
     preprocessing()
 
-    dataset = Dataset(Path(config["torch_dataset"]["path"]) / f"{config["torch_dataset"]["image_h"]}x{config["torch_dataset"]["image_w"]}")
+    dataset = Dataset(Path(config["torch_dataset"]["path"]) / f"{config["torch_dataset"]["image_h"]}x{config["torch_dataset"]["image_w"]}", preload=True)
 
     models = {
-        "convnext_tiny_freeze_v00": TrajectoryTransformer(
-            d_model=256,
+        "convnext_tiny_unfreeze_v00": TrajectoryTransformer(
+            d_model=128,
             nhead_encoder=8,
             nhead_decoder=8,
             n_encoder_layers=4,
             n_decoder_layers=6,
-            dropout=0.1,
-            freeze_backbone=True,
+            dropout=0.3,
+            freeze_backbone=False,
         )
     }
 
@@ -31,7 +31,8 @@ def main():
         batch_size=1,
         warmup_epochs=10,
         num_epochs=300,
-        patience=100
+        patience=100,
+        accum_steps=8
     )
 
 if __name__ == "__main__":

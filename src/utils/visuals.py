@@ -1,8 +1,8 @@
-import matplotlib as mpl
+from src.utils.utils import predict_trajectory
 import matplotlib.pyplot as plt
-import torch
-import os
+import matplotlib as mpl
 import numpy as np
+import os
 
 BG_WINDOW = '#FFFFFF'     
 BG_CARD = '#EBEBEB'
@@ -27,22 +27,7 @@ def plot_training(train_hist, valid_hist, ds, model, device, model_name):
     os.makedirs(out_dir, exist_ok=True)
     epoch_count = len(train_hist)
 
-    # --- Data Acquisition ---
-    model.eval()
-    with torch.no_grad():
-        _, X_frames, X_coords, y_coords = ds[0]
-        pred_coords, _ = model.predict(
-            frames=X_frames.unsqueeze(0).to(device).float() / 255.0,
-            device=device,
-            encoder_trajectory=X_coords.unsqueeze(0).to(device),
-            encoder_traj_lengths=torch.tensor([X_coords.shape[0]], device=device),
-        )
-        pred_coords = ds.destandardize_coords(pred_coords.squeeze(0).cpu()).int()
-        gt_coords = ds.destandardize_coords(y_coords.cpu()).int()
-        
-        targets_index = torch.load(ds.dataset_path / "targets_frames" / "index.pt")
-        target_sample = torch.load(targets_index[0]["file"])
-        bg_frame = target_sample["y_frame"][0]
+    bg_frame, gt_coords, pred_coords = predict_trajectory(model, device, ds, 266)
 
     img_h, img_w = bg_frame.shape[:2]
     aspect_ratio = img_w / img_h 
